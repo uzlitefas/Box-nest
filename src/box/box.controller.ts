@@ -11,7 +11,7 @@ import { BoxsService } from './box.service';
 import { CreateBoxDto } from './dto/create.box.dto';
 import { UpdateBoxDto } from './dto/update.box.dto';
 
-@Controller('todos')
+@Controller('box')
 export class BoxsController {
   constructor(private readonly BoxsService: BoxsService) {}
 
