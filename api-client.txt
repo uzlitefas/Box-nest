@@ -1,0 +1,171 @@
+import { env } from "@/src/lib/env";
+import { getAuthState } from "@/src/stores/auth.store";
+import type { ApiErrorPayload } from "@/src/types/api.types";
+import type { RefreshResponse } from "@/src/types/auth.types";
+
+export class ApiError extends Error {
+  //obyectni boshlangich qiymationi ornatish (kop ishlatilinsa qotadi)
+  constructor(
+    message: string,
+    //public hamayerda foytdalanish mumkin,readonly qiymat faqat constuktirda beriladi
+    public readonly status: number,
+    public readonly payload?: ApiErrorPayload,
+  ) {
+    //extends ishlatish uchun kerak (construkter bolgani uchun yozilgan)
+    super(message);
+    this.name = "ApiError";
+  }
+}
+//omit propetini olib tashlaydi, requestInit fetchni parametir type
+//kod ishlashi requestInit typini olamiz,undan faqat bodyni olib tashlaymiz, ozimizni body ni qoyamiz
+type RequestOptions = Omit<RequestInit, "body"> & {
+  body?: unknown;
+  auth?: boolean;
+  retryOnUnauthorized?: boolean;
+};
+
+
+//serverga 5 marta emas 1 martalik request
+let refreshPromise: Promise<string> | null = null;
+
+
+//path ni qisqartirish
+function resolveApiPath(path: string) {
+  const proxiedPath = `/api${path}`;
+  return `${env.apiUrl}${proxiedPath}`;
+}
+
+//foydalanuvchi qayerdaligi ni qaytaradi
+function currentInternalPath() {
+  if (typeof window === "undefined") return "/dashboard";
+  return `${window.location.pathname}${window.location.search}`;
+}
+
+
+//browserda bolmasa hechnima qilmaydi,
+//user loginda bolsa yana loginga otmaydi
+//turgan sahifangizga qytaradi
+function redirectToLogin() {
+  if (typeof window === "undefined") return;
+  if (window.location.pathname === "/login") return;
+
+  const next = encodeURIComponent(currentInternalPath());
+  window.location.replace(`/login?next=${next}`);
+}
+
+//accestoken va login malumotlar ochiradi , loginga sahifasiga otadi
+function expireSession() {
+  getAuthState().clearSession();
+  redirectToLogin();
+}
+
+
+//hato ushlaydi
+async function parseResponse<T>(response: Response): Promise<T> {
+  if (response.status === 204) return undefined as T;
+
+  const contentType = response.headers.get("content-type") ?? "";
+  const payload = contentType.includes("application/json")
+    ? await response.json()
+    : await response.text();
+
+  if (!response.ok) {
+    const error = typeof payload === "object" ? (payload as ApiErrorPayload) : undefined;
+    const rawMessage = error?.message;
+    const message = Array.isArray(rawMessage)
+      ? rawMessage.join(". ")
+      : rawMessage || (typeof payload === "string" ? payload : "So‘rov bajarilmadi");
+    throw new ApiError(message, response.status, error);
+  }
+
+  return payload as T;
+}
+
+//refresh , access token olish funksiasi
+async function refreshAccessToken() {
+  //refresh bolyotganini tekshirish
+  if (!refreshPromise) {
+    //resolveApiPath url togirlash, fetch orniga axios ishlatilinsa samarali roq
+    refreshPromise = fetch(resolveApiPath("/auth/refresh"), {
+      method: "POST",
+      credentials: "include",
+      cache: "no-store",
+      headers: { Accept: "application/json" },
+    })
+    //data olish uchun kerak, response.data.data qilmaslik uchun
+      .then(parseResponse<RefreshResponse>)
+      .then(({ accessToken }) => {
+        getAuthState().setAccessToken(accessToken);
+        return accessToken;
+      })
+      .catch((error) => {
+        //sessionni tugatadi
+        expireSession();
+        throw error;
+      })
+      .finally(() => {
+        refreshPromise = null;
+      });
+  }
+  return refreshPromise;
+}
+
+
+//assos, sorovlar boshqaradi
+export async function apiClient<T>(path: string, options: RequestOptions = {}) {
+  const {
+    auth = true,
+    retryOnUnauthorized = true,
+    headers,
+    body,
+    ...requestInit
+  } = options;
+  const token = getAuthState().accessToken;
+  const requestHeaders = new Headers(headers);
+  requestHeaders.set("Accept", "application/json");
+//body bor bolsa serverga json deb aytadi
+  if (body !== undefined) requestHeaders.set("Content-Type", "application/json");
+//access requestga qoshish
+  if (auth && token) requestHeaders.set("Authorization", `Bearer ${token}`);
+
+  const response = await fetch(resolveApiPath(path), {
+    ...requestInit,
+    credentials: "include",
+    headers: requestHeaders,
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+
+  if (response.status === 401 && auth && retryOnUnauthorized) {
+    const accessToken = await refreshAccessToken();
+    requestHeaders.set("Authorization", `Bearer ${accessToken}`);
+    const retryResponse = await fetch(resolveApiPath(path), {
+      ...requestInit,
+      credentials: "include",
+      headers: requestHeaders,
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    if (retryResponse.status === 401) expireSession();
+    return parseResponse<T>(retryResponse);
+  }
+
+  return parseResponse<T>(response);
+}
+
+//fayil yuborish uchun maxsus client
+export async function apiFileClient(path: string, body?: FormData, method = "POST") {
+  const requestHeaders = new Headers({ Accept: "application/json, application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+  const token = getAuthState().accessToken;
+  if (token) requestHeaders.set("Authorization", `Bearer ${token}`);
+
+  let response = await fetch(resolveApiPath(path), { method, body, credentials: "include", headers: requestHeaders });
+  if (response.status === 401) {
+    const accessToken = await refreshAccessToken();
+    requestHeaders.set("Authorization", `Bearer ${accessToken}`);
+    response = await fetch(resolveApiPath(path), { method, body, credentials: "include", headers: requestHeaders });
+    if (response.status === 401) expireSession();
+  }
+  if (!response.ok) await parseResponse(response);
+  return response;
+}
+
+export { refreshAccessToken };
